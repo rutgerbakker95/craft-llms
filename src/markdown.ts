@@ -1,3 +1,4 @@
+import fs from 'node:fs/promises';
 import path from 'node:path';
 
 type FenceState = {
@@ -8,6 +9,85 @@ type FenceState = {
 const INLINE_LINK_RE = /(?<!!)\[([^\]]+)\]\(([^)]+)\)/g;
 const HEADING_RE = /^#{1,6}\s+/;
 const LIST_RE = /^\s*([-*+]|\d+\.)\s+/;
+const INCLUDE_DIRECTIVE_RE = /!!!include\(([^)]+)\)!!!/g;
+const COMPONENT_TAG_RE = /<\/?([A-Za-z][^\s/>]*)(\s[^>]*)?>/g;
+const HTML_TAG_ONLY_RE = /^<[^>]+>$/;
+const INLINE_COMPONENT_TAGS = new Set(['badge', 'cloud', 'journey', 'see', 'since', 'todo']);
+const DROP_COMPONENT_TAGS = new Set(['block', 'browsershot', 'codeplaceholder', 'column', 'columns', 'tab', 'tabs']);
+const STANDARD_HTML_TAGS = new Set([
+  'a',
+  'abbr',
+  'address',
+  'article',
+  'aside',
+  'audio',
+  'b',
+  'blockquote',
+  'br',
+  'button',
+  'caption',
+  'cite',
+  'code',
+  'col',
+  'colgroup',
+  'data',
+  'datalist',
+  'dd',
+  'del',
+  'details',
+  'dfn',
+  'div',
+  'dl',
+  'dt',
+  'em',
+  'figcaption',
+  'figure',
+  'footer',
+  'form',
+  'h1',
+  'h2',
+  'h3',
+  'h4',
+  'h5',
+  'h6',
+  'header',
+  'hr',
+  'i',
+  'img',
+  'input',
+  'ins',
+  'kbd',
+  'label',
+  'li',
+  'main',
+  'mark',
+  'nav',
+  'ol',
+  'p',
+  'pre',
+  'q',
+  's',
+  'samp',
+  'section',
+  'small',
+  'span',
+  'strong',
+  'sub',
+  'summary',
+  'sup',
+  'table',
+  'tbody',
+  'td',
+  'textarea',
+  'tfoot',
+  'th',
+  'thead',
+  'time',
+  'tr',
+  'u',
+  'ul',
+  'var'
+]);
 
 function updateFenceState(line: string, state: FenceState): FenceState {
   const trimmed = line.trim();
@@ -39,6 +119,62 @@ export function stripFrontmatter(content: string): string {
   return content;
 }
 
+export async function expandIncludeDirectives(
+  content: string,
+  options: { repoRoot: string; currentFilePath: string; maxDepth?: number },
+): Promise<string> {
+  const repoRoot = path.resolve(options.repoRoot);
+  const maxDepth = options.maxDepth ?? 5;
+  const cache = new Map<string, string>();
+
+  const expand = async (
+    input: string,
+    filePath: string,
+    depth: number,
+    stack: Set<string>,
+  ): Promise<string> => {
+    if (depth > maxDepth) {
+      throw new Error(`Include depth exceeded ${maxDepth} at ${filePath}`);
+    }
+
+    const matches = Array.from(input.matchAll(INCLUDE_DIRECTIVE_RE));
+    if (matches.length === 0) {
+      return input;
+    }
+
+    let result = '';
+    let lastIndex = 0;
+    for (const match of matches) {
+      const matchIndex = match.index ?? 0;
+      result += input.slice(lastIndex, matchIndex);
+      lastIndex = matchIndex + match[0].length;
+
+      const includePath = match[1].trim();
+      const resolvedPath = resolveIncludePath(includePath, repoRoot, filePath);
+
+      if (stack.has(resolvedPath)) {
+        throw new Error(`Include cycle detected at ${resolvedPath}`);
+      }
+
+      let included = cache.get(resolvedPath);
+      if (included === undefined) {
+        included = await fs.readFile(resolvedPath, 'utf8');
+        cache.set(resolvedPath, included);
+      }
+
+      stack.add(resolvedPath);
+      const expanded = await expand(included, resolvedPath, depth + 1, stack);
+      stack.delete(resolvedPath);
+      result += expanded;
+    }
+
+    result += input.slice(lastIndex);
+    return result;
+  };
+
+  return expand(content, options.currentFilePath, 0, new Set<string>());
+}
+
 export function stripVuePressDirectives(content: string): string {
   const lines = content.split('\n');
   let state: FenceState = { inFence: false, fenceMarker: '' };
@@ -46,10 +182,19 @@ export function stripVuePressDirectives(content: string): string {
 
   for (const line of lines) {
     state = updateFenceState(line, state);
-    if (!state.inFence && line.trim().startsWith(':::')) {
+    if (state.inFence) {
+      output.push(line);
       continue;
     }
-    output.push(line);
+
+    const trimmed = line.trim();
+    if (trimmed.startsWith(':::') || trimmed.startsWith('!!!')) {
+      continue;
+    }
+
+    const withoutComments = stripHtmlComments(line);
+    const replaced = replaceComponentTags(withoutComments);
+    output.push(replaced);
   }
 
   return output.join('\n');
@@ -71,6 +216,24 @@ export function extractTitle(content: string, fallback: string): string {
   }
 
   return fallback;
+}
+
+export function stripLeadingH1(content: string): string {
+  const lines = content.split('\n');
+  let state: FenceState = { inFence: false, fenceMarker: '' };
+  let removed = false;
+  const output: string[] = [];
+
+  for (const line of lines) {
+    state = updateFenceState(line, state);
+    if (!state.inFence && !removed && /^#\s+/.test(line)) {
+      removed = true;
+      continue;
+    }
+    output.push(line);
+  }
+
+  return output.join('\n');
 }
 
 export function docPathToUrl(relativePath: string, baseUrl: string): string {
@@ -136,6 +299,9 @@ export function extractSummary(content: string): string {
     }
 
     if (HEADING_RE.test(trimmed) || LIST_RE.test(trimmed)) {
+      continue;
+    }
+    if (HTML_TAG_ONLY_RE.test(trimmed)) {
       continue;
     }
 
@@ -258,8 +424,129 @@ function cleanSummaryText(text: string): string {
   let cleaned = text;
   cleaned = cleaned.replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1');
   cleaned = cleaned.replace(/\[([^\]]+)\]\([^)]*\)/g, '$1');
+  cleaned = cleaned.replace(/<[^>]+>/g, '');
   cleaned = cleaned.replace(/`([^`]*)`/g, '$1');
   cleaned = cleaned.replace(/^>+\s*/g, '');
   cleaned = cleaned.replace(/\s+/g, ' ').trim();
   return cleaned;
+}
+
+function resolveIncludePath(includePath: string, repoRoot: string, currentFilePath: string): string {
+  let resolvedPath = '';
+  if (includePath.startsWith('/')) {
+    resolvedPath = path.join(repoRoot, includePath.replace(/^\/+/, ''));
+  } else if (includePath.startsWith('.')) {
+    resolvedPath = path.resolve(path.dirname(currentFilePath), includePath);
+  } else {
+    resolvedPath = path.join(repoRoot, includePath);
+  }
+
+  const normalizedRoot = path.resolve(repoRoot);
+  const normalizedPath = path.resolve(resolvedPath);
+  if (
+    normalizedPath !== normalizedRoot &&
+    !normalizedPath.startsWith(`${normalizedRoot}${path.sep}`)
+  ) {
+    throw new Error(`Include path escapes repo root: ${includePath}`);
+  }
+
+  return normalizedPath;
+}
+
+function stripHtmlComments(line: string): string {
+  return line.replace(/<!--[\s\S]*?-->/g, '');
+}
+
+function replaceComponentTags(line: string): string {
+  return line.replace(COMPONENT_TAG_RE, (match, tagName: string, attrPart: string = '') => {
+    const isClosing = match.startsWith('</');
+    const isSelfClosing = match.endsWith('/>');
+    const lowerName = tagName.toLowerCase();
+
+    if (STANDARD_HTML_TAGS.has(lowerName)) {
+      return match;
+    }
+
+    if (DROP_COMPONENT_TAGS.has(lowerName)) {
+      return '';
+    }
+
+    if (isClosing) {
+      return '';
+    }
+
+    if (tagName.includes(':')) {
+      return tagName;
+    }
+
+    const attrs = parseAttributes(attrPart);
+    if (INLINE_COMPONENT_TAGS.has(lowerName) || isSelfClosing) {
+      const text = componentText(tagName, attrs);
+      return text || tagName;
+    }
+
+    if (Object.keys(attrs).length > 0) {
+      return '';
+    }
+
+    if (/^[A-Z]/.test(tagName)) {
+      return '';
+    }
+
+    return tagName;
+  });
+}
+
+function parseAttributes(raw: string): Record<string, string> {
+  const attrs: Record<string, string> = {};
+  const regex = /([A-Za-z0-9:_-]+)\s*=\s*"([^"]*)"/g;
+  let match = regex.exec(raw);
+  while (match) {
+    attrs[match[1].toLowerCase()] = match[2];
+    match = regex.exec(raw);
+  }
+  return attrs;
+}
+
+function componentText(tagName: string, attrs: Record<string, string>): string {
+  const name = tagName.toLowerCase();
+  if (name === 'since') {
+    const ver = attrs.ver ?? attrs.version ?? '';
+    const feature = attrs.feature ?? attrs.text ?? attrs.label ?? '';
+    if (ver && feature) {
+      return `Since ${ver}: ${feature}`;
+    }
+    if (ver) {
+      return `Since ${ver}`;
+    }
+    if (feature) {
+      return `Since: ${feature}`;
+    }
+    return 'Since';
+  }
+  if (name === 'badge') {
+    return attrs.text ?? attrs.label ?? attrs.title ?? '';
+  }
+  if (name === 'todo') {
+    const notes = attrs.notes ?? attrs.text ?? attrs.label ?? '';
+    return notes ? `TODO: ${notes}` : 'TODO';
+  }
+  if (name === 'journey') {
+    const pathValue = attrs.path ?? attrs.label ?? attrs.text ?? '';
+    return pathValue ? `Journey: ${pathValue}` : 'Journey';
+  }
+  if (name === 'see') {
+    const label = attrs.label ?? attrs.text ?? attrs.title ?? '';
+    const description = attrs.description ?? attrs.desc ?? '';
+    const target = attrs.path ?? attrs.url ?? '';
+    const parts = [label, description, target].filter(Boolean);
+    if (parts.length === 0) {
+      return 'See';
+    }
+    return parts.join(' - ');
+  }
+  if (name === 'cloud') {
+    return '';
+  }
+  return attrs.text ?? attrs.label ?? attrs.title ?? '';
 }

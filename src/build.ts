@@ -3,10 +3,12 @@ import path from 'node:path';
 import { ensureDocsRepo, getRepoMeta } from './git.js';
 import {
   docPathToUrl,
+  expandIncludeDirectives,
   extractSummary,
   extractTitle,
   normalizeLinks,
   stripFrontmatter,
+  stripLeadingH1,
   stripVuePressDirectives
 } from './markdown.js';
 import type { BuildConfig } from './config.js';
@@ -50,20 +52,25 @@ export async function build(config: BuildConfig): Promise<BuildResult> {
   for (const filePath of files) {
     const raw = await fs.readFile(filePath, 'utf8');
     const withoutFrontmatter = stripFrontmatter(raw);
-    const cleaned = stripVuePressDirectives(withoutFrontmatter);
+    const expanded = await expandIncludeDirectives(withoutFrontmatter, {
+      repoRoot: docsRepoDir,
+      currentFilePath: filePath
+    });
+    const cleaned = stripVuePressDirectives(expanded);
 
     const relPath = toPosixPath(path.relative(docsRoot, filePath));
     const fallbackTitle = path.basename(filePath, path.extname(filePath));
     const title = extractTitle(cleaned, fallbackTitle);
 
-    const normalizedContent = normalizeLinks(cleaned, {
+    const contentWithoutTitle = stripLeadingH1(cleaned);
+    const normalizedContent = normalizeLinks(contentWithoutTitle, {
       baseUrl,
       currentFilePath: relPath
     }).trimEnd();
 
     pageChunks.push('---', `# ${title}`, normalizedContent, '');
 
-    const summary = extractSummary(cleaned);
+    const summary = extractSummary(contentWithoutTitle);
     const url = docPathToUrl(relPath, baseUrl);
     const group = relPath.includes('/') ? relPath.split('/')[0] : 'root';
     const entries = indexGroups.get(group) ?? [];
