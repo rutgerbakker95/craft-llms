@@ -1,0 +1,9 @@
+[build]
+  command = "node dist/src/cli.js build"
+  publish = "public"
+
+[[redirects]]
+  from = "/"
+  to = "/llms-full.txt"
+  status = 301
+  force = true
