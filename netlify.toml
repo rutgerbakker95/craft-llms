@@ -4,7 +4,7 @@
 
 [[redirects]]
   from = "/"
-  to = "/llms-full.txt"
+  to = "/llms.txt"
   status = 301
   force = true
 
