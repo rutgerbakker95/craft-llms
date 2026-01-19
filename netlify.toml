@@ -7,3 +7,6 @@
   to = "/llms-full.txt"
   status = 301
   force = true
+
+[functions."llms-build-schedule"]
+  schedule = "@weekly"
